@@ -1,0 +1,39 @@
+# Dependencies
+**/node_modules/
+
+# Build output
+**/target/
+**/dist/
+**/build/
+**/*.class
+
+# Runtime and sandbox data
+**/tmpCode/
+**/*.log
+**/.mysql-data/
+**/.redis-data/
+**/.rabbitmq-data/
+**/.nacos-data/
+
+# Local environment files
+**/.env
+**/.env.*
+!**/.env.example
+
+# IDE files
+**/.idea/
+**/.vscode/
+**/.cursor/
+**/*.iml
+**/*.iws
+**/*.ipr
+**/*.suo
+**/*.sw?
+
+# Language caches
+**/__pycache__/
+**/*.py[cod]
+
+# OS metadata
+**/.DS_Store
+**/Thumbs.db
