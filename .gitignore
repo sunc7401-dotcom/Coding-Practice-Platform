@@ -37,3 +37,6 @@
 # OS metadata
 **/.DS_Store
 **/Thumbs.db
+
+# Local Codex instructions
+/AGENTS.md
