@@ -1,6 +1,6 @@
-# YUOJ 在线代码练习平台
+# 在线代码练习平台
 
-YUOJ 是一个前后端分离、微服务架构的在线代码练习与判题平台。用户可以浏览题目、在线编写并提交代码，系统通过 RabbitMQ 异步分发判题任务，由独立判题服务调用 Docker 代码沙箱完成编译和运行，最终保存并展示判题结果。
+在线代码练习平台采用前后端分离和微服务架构。用户可以浏览题目、在线编写并提交代码，系统通过 RabbitMQ 异步分发判题任务，由独立判题服务调用 Docker 代码沙箱完成编译和运行，最终保存并展示判题结果。
 
 本仓库包含 Vue 前端、Spring Cloud 微服务后端和独立代码沙箱三个子项目。
 
@@ -89,24 +89,19 @@ flowchart LR
 | 中间件 | Redis 6、RabbitMQ 3.12、Nacos 2.2 |
 | 网关与文档 | Spring Cloud Gateway、Knife4j |
 | 代码沙箱 | Spring Boot、Docker Java 3.3、Docker Engine |
-| 工程化 | Maven、npm、Docker Compose、JUnit 5 |
+| 工程化 | Maven、npm、Docker Compose |
 
 ## 项目结构
 
-```text
-.
-├── yuoj-frontend-master/                 # Vue 3 前端
-├── yuoj-backend-microservice-master/     # Spring Cloud 微服务后端
-│   ├── yuoj-backend-gateway/             # API 网关，端口 8101
-│   ├── yuoj-backend-user-service/        # 用户服务，端口 8102
-│   ├── yuoj-backend-question-service/    # 题目与提交服务，端口 8103
-│   ├── yuoj-backend-judge-service/       # 判题服务，端口 8104
-│   ├── yuoj-backend-common/              # 通用工具与统一响应
-│   ├── yuoj-backend-model/               # 公共实体、DTO 与枚举
-│   ├── yuoj-backend-service-client/      # OpenFeign 服务接口
-│   └── mysql-init/                       # 数据库初始化脚本
-└── yuoj-code-sandbox-master/             # Docker 代码沙箱，端口 8090
-```
+| 模块 | 说明 | 默认端口 |
+| --- | --- | ---: |
+| 前端项目 | Vue 3 用户界面、题目展示与在线代码编辑 | 8080 |
+| API 网关 | 统一请求入口与服务路由 | 8101 |
+| 用户服务 | 用户、登录会话与权限管理 | 8102 |
+| 题目服务 | 题目、提交记录与 Outbox 事件管理 | 8103 |
+| 判题服务 | 消息消费、判题编排与结果保存 | 8104 |
+| 公共模块 | 通用工具、数据模型与 OpenFeign 接口 | - |
+| 代码沙箱 | Docker 隔离编译与运行 | 8090 |
 
 ## 本地运行
 
@@ -119,8 +114,9 @@ flowchart LR
 
 ### 1. 启动基础设施
 
+进入后端微服务子项目目录后执行：
+
 ```bash
-cd yuoj-backend-microservice-master
 docker compose -f docker-compose.env.yml up -d
 ```
 
@@ -134,24 +130,21 @@ docker compose -f docker-compose.env.yml up -d
 
 ### 2. 构建并启动后端
 
+在后端微服务子项目目录中执行：
+
 ```bash
-cd yuoj-backend-microservice-master
-mvn clean install -DskipTests
+mvn clean compile
 ```
 
-构建完成后，可在 IDE 中依次启动以下应用：
-
-1. `YuojBackendGatewayApplication`
-2. `YuojBackendUserServiceApplication`
-3. `YuojBackendQuestionServiceApplication`
-4. `YuojBackendJudgeServiceApplication`
+编译完成后，可在 IDE 中依次启动网关、用户服务、题目服务和判题服务对应的 Spring Boot 启动类。
 
 本地配置默认连接 `localhost` 上的 MySQL、Redis、RabbitMQ 和 Nacos。
 
 ### 3. 启动代码沙箱
 
+进入代码沙箱子项目目录后执行：
+
 ```bash
-cd yuoj-code-sandbox-master
 docker pull eclipse-temurin:8-jdk-alpine
 mvn spring-boot:run
 ```
@@ -160,44 +153,21 @@ mvn spring-boot:run
 
 ### 4. 启动前端
 
+进入前端子项目目录后执行：
+
 ```bash
-cd yuoj-frontend-master
 npm install
 npm run serve
 ```
 
-本地联调前，将 `yuoj-frontend-master/generated/core/OpenAPI.ts` 中的 `BASE` 设置为网关地址：
+本地联调前，将前端生成客户端 `generated/core/OpenAPI.ts` 中的 `BASE` 设置为网关地址：
 
 ```ts
 BASE: "http://localhost:8101"
 ```
 
-## 测试
-
-判题消息可靠性定向测试：
-
-```bash
-cd yuoj-backend-microservice-master
-mvn -pl yuoj-backend-question-service -am test \
-  "-Dtest=JudgeTaskOutboxPublisherTest" \
-  "-Dsurefire.failIfNoSpecifiedTests=false"
-mvn -pl yuoj-backend-judge-service -am test \
-  "-Dtest=JudgeRabbitMqConfigTest,MyMessageConsumerTest" \
-  "-Dsurefire.failIfNoSpecifiedTests=false"
-```
-
-代码沙箱测试：
-
-```bash
-cd yuoj-code-sandbox-master
-mvn test
-```
-
-代码沙箱目前包含 PID 配置、超时强制终止、输出上限和异常清理等安全边界测试。真实容器测试需要本机 Docker 服务处于运行状态。
-
 ## 后续规划
 
 - 将沙箱鉴权密钥和服务地址迁移到外部配置，避免硬编码。
-- 增加 Docker 容器级攻击样例与集成测试。
 - 接入可观测性组件，监控 Outbox 积压、判题重试、DLQ 数量和沙箱资源使用。
 - 扩展更多编程语言镜像及对应判题策略。
