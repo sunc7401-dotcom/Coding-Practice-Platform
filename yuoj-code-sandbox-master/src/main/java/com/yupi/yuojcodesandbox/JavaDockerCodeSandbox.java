@@ -8,6 +8,8 @@ import com.github.dockerjava.api.model.*;
 import com.github.dockerjava.core.DockerClientBuilder;
 import com.github.dockerjava.core.command.ExecStartResultCallback;
 import com.yupi.yuojcodesandbox.model.ExecuteMessage;
+import com.yupi.yuojcodesandbox.utils.LimitedOutputCollector;
+import com.yupi.yuojcodesandbox.utils.ProcessUtils;
 import org.springframework.stereotype.Component;
 import org.springframework.util.StopWatch;
 
@@ -18,11 +20,16 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Component
 public class JavaDockerCodeSandbox extends JavaCodeSandboxTemplate {
 
     private static final long TIME_OUT = 5L;
+
+    private static final long MAX_PIDS = 64L;
+
+    private static final int MAX_OUTPUT_BYTES = 1024 * 1024;
 
     private static final Boolean FIRST_INIT = true;
 
@@ -91,12 +98,7 @@ public class JavaDockerCodeSandbox extends JavaCodeSandboxTemplate {
         // 创建容器
 
         CreateContainerCmd containerCmd = dockerClient.createContainerCmd(image);
-        HostConfig hostConfig = new HostConfig();
-        hostConfig.withMemory(100 * 1000 * 1000L);
-        hostConfig.withMemorySwap(0L);
-        hostConfig.withCpuCount(1L);
-//        hostConfig.withSecurityOpts(Arrays.asList("seccomp=安全管理配置字符串"));
-        hostConfig.setBinds(new Bind(userCodeParentPath, new Volume("/app")));
+        HostConfig hostConfig = createHostConfig(userCodeParentPath);
         CreateContainerResponse createContainerResponse = containerCmd
                 .withHostConfig(hostConfig)
                 .withNetworkDisabled(true)
@@ -104,7 +106,7 @@ public class JavaDockerCodeSandbox extends JavaCodeSandboxTemplate {
                 .withAttachStdin(true)
                 .withAttachStderr(true)
                 .withAttachStdout(true)
-                .withTty(true)
+                .withTty(false)
                 .withCmd("sh", "-c", "while true; do sleep 3600; done")
                 .exec();
         System.out.println(createContainerResponse);
@@ -130,29 +132,17 @@ public class JavaDockerCodeSandbox extends JavaCodeSandboxTemplate {
                 System.out.println("创建执行命令：" + execCreateCmdResponse);
 
                 ExecuteMessage executeMessage = new ExecuteMessage();
-                final String[] message = {null};
-                final String[] errorMessage = {null};
-                long time = 0L;
-                // 判断是否超时
-                final boolean[] timeout = {true};
+                LimitedOutputCollector outputCollector = new LimitedOutputCollector(MAX_OUTPUT_BYTES);
+                AtomicBoolean outputLimitExceeded = new AtomicBoolean(false);
                 String execId = execCreateCmdResponse.getId();
                 ExecStartResultCallback execStartResultCallback = new ExecStartResultCallback() {
                     @Override
-                    public void onComplete() {
-                        // 如果执行完成，则表示没超时
-                        timeout[0] = false;
-                        super.onComplete();
-                    }
-
-                    @Override
                     public void onNext(Frame frame) {
                         StreamType streamType = frame.getStreamType();
-                        if (StreamType.STDERR.equals(streamType)) {
-                            errorMessage[0] = new String(frame.getPayload()).trim();
-                            System.out.println("输出错误结果：" + errorMessage[0]);
-                        } else {
-                            message[0] = new String(frame.getPayload()).trim();
-                            System.out.println("输出结果：" + message[0]);
+                        boolean errorStream = StreamType.STDERR.equals(streamType);
+                        if (!outputCollector.append(frame.getPayload(), errorStream)
+                                && outputLimitExceeded.compareAndSet(false, true)) {
+                            killContainerQuietly(dockerClient, containerId, "output limit exceeded");
                         }
                         super.onNext(frame);
                     }
@@ -196,27 +186,44 @@ public class JavaDockerCodeSandbox extends JavaCodeSandboxTemplate {
 
                     }
                 });
+                boolean timedOut = false;
                 try {
                     memoryLatch.await(200, TimeUnit.MILLISECONDS);
                     stopWatch.start();
-                    dockerClient.execStartCmd(execId)
+                    boolean completed = dockerClient.execStartCmd(execId)
                             .exec(execStartResultCallback)
                             .awaitCompletion(TIME_OUT, TimeUnit.SECONDS);
-                    stopWatch.stop();
-                    time = stopWatch.getLastTaskTimeMillis();
-                    statisticsResultCallback.close();
-                    statsCmd.close();
+                    if (!completed && !outputLimitExceeded.get()) {
+                        timedOut = true;
+                        killContainerQuietly(dockerClient, containerId, "time limit exceeded");
+                        execStartResultCallback.awaitCompletion(1L, TimeUnit.SECONDS);
+                    }
                 } catch (InterruptedException e) {
-                    System.out.println("程序执行异常");
+                    Thread.currentThread().interrupt();
+                    killContainerQuietly(dockerClient, containerId, "judge thread interrupted");
                     throw new RuntimeException(e);
-                } catch (IOException e) {
-                    throw new RuntimeException(e);
+                } finally {
+                    if (stopWatch.isRunning()) {
+                        stopWatch.stop();
+                    }
+                    closeQuietly(statisticsResultCallback);
+                    statsCmd.close();
+                    closeQuietly(execStartResultCallback);
                 }
-                executeMessage.setMessage(message[0]);
-                executeMessage.setErrorMessage(errorMessage[0]);
-                executeMessage.setTime(time);
+                executeMessage.setMessage(outputCollector.getStdout().trim());
+                if (outputLimitExceeded.get()) {
+                    executeMessage.setErrorMessage(ProcessUtils.OUTPUT_LIMIT_EXCEEDED);
+                } else if (timedOut) {
+                    executeMessage.setErrorMessage(ProcessUtils.TIME_LIMIT_EXCEEDED);
+                } else if (!outputCollector.getStderr().trim().isEmpty()) {
+                    executeMessage.setErrorMessage(outputCollector.getStderr().trim());
+                }
+                executeMessage.setTime(stopWatch.getLastTaskTimeMillis());
                 executeMessage.setMemory(maxMemory[0]/1024/1024);
                 executeMessageList.add(executeMessage);
+                if (timedOut || outputLimitExceeded.get()) {
+                    break;
+                }
             }
             return executeMessageList;
         } finally {
@@ -237,7 +244,34 @@ public class JavaDockerCodeSandbox extends JavaCodeSandboxTemplate {
             }
         }
     }
-}
 
+    HostConfig createHostConfig(String userCodeParentPath) {
+        HostConfig hostConfig = new HostConfig();
+        hostConfig.withMemory(100 * 1000 * 1000L);
+        hostConfig.withMemorySwap(0L);
+        hostConfig.withCpuCount(1L);
+        hostConfig.withPidsLimit(MAX_PIDS);
+        hostConfig.setBinds(new Bind(userCodeParentPath, new Volume("/app")));
+        return hostConfig;
+    }
+
+    private void killContainerQuietly(DockerClient dockerClient, String containerId, String reason) {
+        try {
+            dockerClient.killContainerCmd(containerId).exec();
+        } catch (Exception e) {
+            System.out.println("终止容器失败（" + reason + "）：" + e.getMessage());
+        }
+    }
+
+    private void closeQuietly(Closeable closeable) {
+        if (closeable == null) {
+            return;
+        }
+        try {
+            closeable.close();
+        } catch (IOException ignored) {
+        }
+    }
+}
 
 

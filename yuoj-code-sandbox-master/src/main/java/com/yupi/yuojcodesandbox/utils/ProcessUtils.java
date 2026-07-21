@@ -2,17 +2,21 @@ package com.yupi.yuojcodesandbox.utils;
 
 import cn.hutool.core.util.StrUtil;
 import com.yupi.yuojcodesandbox.model.ExecuteMessage;
-import org.apache.commons.lang3.StringUtils;
 import org.springframework.util.StopWatch;
 
 import java.io.*;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * 进程工具类
  */
 public class ProcessUtils {
+
+    public static final int DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
+
+    public static final String TIME_LIMIT_EXCEEDED = "Time Limit Exceeded";
+
+    public static final String OUTPUT_LIMIT_EXCEEDED = "Output Limit Exceeded";
 
     /**
      * 执行进程并获取信息
@@ -22,57 +26,107 @@ public class ProcessUtils {
      * @return
      */
     public static ExecuteMessage runProcessAndGetMessage(Process runProcess, String opName) {
+        return runProcessAndGetMessage(runProcess, opName, 0L, DEFAULT_MAX_OUTPUT_BYTES);
+    }
+
+    /**
+     * Executes a process while draining stdout/stderr concurrently. The process is
+     * forcibly terminated as soon as it exceeds either the time or output limit.
+     */
+    public static ExecuteMessage runProcessAndGetMessage(Process runProcess, String opName,
+                                                         long timeoutMs, int maxOutputBytes) {
         ExecuteMessage executeMessage = new ExecuteMessage();
-
+        LimitedOutputCollector outputCollector = new LimitedOutputCollector(maxOutputBytes);
+        Thread stdoutReader = startReader(runProcess, runProcess.getInputStream(), outputCollector,
+                false, opName + "-stdout");
+        Thread stderrReader = startReader(runProcess, runProcess.getErrorStream(), outputCollector,
+                true, opName + "-stderr");
+        StopWatch stopWatch = new StopWatch();
+        stopWatch.start();
         try {
-            //todo 不应该在执行命令行之前就开始计时吗？这里是执行命令行之后才开始计时的
-            StopWatch stopWatch = new StopWatch();
-            stopWatch.start();
-            // 等待程序执行，获取错误码
-            int exitValue = runProcess.waitFor();
-            executeMessage.setExitValue(exitValue);
-            // 正常退出
-            if (exitValue == 0) {
-                System.out.println(opName + "成功");
-                // 分批获取进程的正常输出
-                BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(runProcess.getInputStream()));
-                List<String> outputStrList = new ArrayList<>();
-                // 逐行读取
-                String compileOutputLine;
-                while ((compileOutputLine = bufferedReader.readLine()) != null) {
-                    outputStrList.add(compileOutputLine);
-                }
-                executeMessage.setMessage(StringUtils.join(outputStrList, "\n"));
+            boolean completed;
+            if (timeoutMs > 0) {
+                completed = runProcess.waitFor(timeoutMs, TimeUnit.MILLISECONDS);
             } else {
-                // 异常退出
-                System.out.println(opName + "失败，错误码： " + exitValue);
-                // 分批获取进程的正常输出
-                BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(runProcess.getInputStream()));
-                List<String> outputStrList = new ArrayList<>();
-                // 逐行读取
-                String compileOutputLine;
-                while ((compileOutputLine = bufferedReader.readLine()) != null) {
-                    outputStrList.add(compileOutputLine);
-                }
-                executeMessage.setMessage(StringUtils.join(outputStrList, "\n"));
-
-                // 分批获取进程的错误输出
-                BufferedReader errorBufferedReader = new BufferedReader(new InputStreamReader(runProcess.getErrorStream()));
-                // 逐行读取
-                List<String> errorOutputStrList = new ArrayList<>();
-                // 逐行读取
-                String errorCompileOutputLine;
-                while ((errorCompileOutputLine = errorBufferedReader.readLine()) != null) {
-                    errorOutputStrList.add(errorCompileOutputLine);
-                }
-                executeMessage.setErrorMessage(StringUtils.join(errorOutputStrList, "\n"));
+                runProcess.waitFor();
+                completed = true;
             }
-            stopWatch.stop();
+            if (!completed) {
+                destroyProcess(runProcess);
+                executeMessage.setErrorMessage(TIME_LIMIT_EXCEEDED);
+            }
+            joinReader(stdoutReader);
+            joinReader(stderrReader);
+            if (outputCollector.isLimitExceeded()) {
+                executeMessage.setErrorMessage(OUTPUT_LIMIT_EXCEEDED);
+            } else if (executeMessage.getErrorMessage() == null && !outputCollector.getStderr().isEmpty()) {
+                executeMessage.setErrorMessage(outputCollector.getStderr());
+            }
+            executeMessage.setMessage(outputCollector.getStdout());
+            executeMessage.setExitValue(safeExitValue(runProcess));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            destroyProcess(runProcess);
+            executeMessage.setErrorMessage("Process interrupted");
+        } finally {
+            if (stopWatch.isRunning()) {
+                stopWatch.stop();
+            }
             executeMessage.setTime(stopWatch.getLastTaskTimeMillis());
-        } catch (Exception e) {
-            e.printStackTrace();
         }
         return executeMessage;
+    }
+
+    private static Thread startReader(Process process, InputStream inputStream,
+                                      LimitedOutputCollector collector, boolean errorStream,
+                                      String threadName) {
+        Thread reader = new Thread(() -> {
+            byte[] buffer = new byte[4096];
+            try (InputStream stream = inputStream) {
+                int read;
+                while ((read = stream.read(buffer)) != -1) {
+                    byte[] payload = new byte[read];
+                    System.arraycopy(buffer, 0, payload, 0, read);
+                    if (!collector.append(payload, errorStream)) {
+                        destroyProcess(process);
+                        break;
+                    }
+                }
+            } catch (IOException ignored) {
+                // Stream closure is expected when a timed-out or noisy process is killed.
+            }
+        }, threadName);
+        reader.setDaemon(true);
+        reader.start();
+        return reader;
+    }
+
+    private static void joinReader(Thread reader) throws InterruptedException {
+        reader.join(1000L);
+    }
+
+    private static int safeExitValue(Process process) {
+        try {
+            return process.exitValue();
+        } catch (IllegalThreadStateException e) {
+            return -1;
+        }
+    }
+
+    private static void destroyProcess(Process process) {
+        if (!process.isAlive()) {
+            return;
+        }
+        process.destroy();
+        try {
+            if (!process.waitFor(200L, TimeUnit.MILLISECONDS)) {
+                process.destroyForcibly();
+                process.waitFor(1L, TimeUnit.SECONDS);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            process.destroyForcibly();
+        }
     }
 
     /**

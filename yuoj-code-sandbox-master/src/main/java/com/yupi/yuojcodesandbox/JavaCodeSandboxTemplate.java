@@ -32,26 +32,23 @@ public abstract class JavaCodeSandboxTemplate implements CodeSandbox {
         List<String> inputList = executeCodeRequest.getInputList();
         String code = executeCodeRequest.getCode();
         String language = executeCodeRequest.getLanguage();
-
-//        1. 把用户的代码保存为文件
-        File userCodeFile = saveCodeToFile(code);
-
-//        2. 编译代码，得到 class 文件
-        ExecuteMessage compileFileExecuteMessage = compileFile(userCodeFile);
-        System.out.println(compileFileExecuteMessage);
-
-        // 3. 执行代码，得到输出结果
-        List<ExecuteMessage> executeMessageList = runFile(userCodeFile, inputList);
-
-//        4. 收集整理输出结果
-        ExecuteCodeResponse outputResponse = getOutputResponse(executeMessageList);
-
-//        5. 文件清理
-        boolean b = deleteFile(userCodeFile);
-        if (!b) {
-            log.error("deleteFile error, userCodeFilePath = {}", userCodeFile.getAbsolutePath());
+        File userCodeFile = null;
+        try {
+            // 1. 把用户的代码保存为文件
+            userCodeFile = saveCodeToFile(code);
+            // 2. 编译代码，得到 class 文件
+            ExecuteMessage compileFileExecuteMessage = compileFile(userCodeFile);
+            log.debug("compile result: {}", compileFileExecuteMessage);
+            // 3. 执行代码，得到输出结果
+            List<ExecuteMessage> executeMessageList = runFile(userCodeFile, inputList);
+            // 4. 收集整理输出结果
+            return getOutputResponse(executeMessageList);
+        } finally {
+            // 5. 编译、运行、超时或输出超限时都清理用户临时目录
+            if (userCodeFile != null && !deleteFile(userCodeFile)) {
+                log.error("deleteFile error, userCodeFilePath = {}", userCodeFile.getAbsolutePath());
+            }
         }
-        return outputResponse;
     }
 
 
@@ -131,17 +128,8 @@ public abstract class JavaCodeSandboxTemplate implements CodeSandbox {
             String runCmd = String.format("java -Xmx256m -Dfile.encoding=UTF-8 -cp %s Main %s", userCodeParentPath, inputArgs);
             try {
                 Process runProcess = Runtime.getRuntime().exec(runCmd);
-                // 超时控制
-                new Thread(() -> {
-                    try {
-                        Thread.sleep(TIME_OUT);
-                        System.out.println("超时了，中断");
-                        runProcess.destroy();
-                    } catch (InterruptedException e) {
-                        throw new RuntimeException(e);
-                    }
-                }).start();
-                ExecuteMessage executeMessage = ProcessUtils.runProcessAndGetMessage(runProcess, "运行");
+                ExecuteMessage executeMessage = ProcessUtils.runProcessAndGetMessage(
+                        runProcess, "运行", TIME_OUT, ProcessUtils.DEFAULT_MAX_OUTPUT_BYTES);
                 System.out.println(executeMessage);
                 executeMessageList.add(executeMessage);
             } catch (Exception e) {
